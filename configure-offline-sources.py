@@ -132,13 +132,17 @@ def is_git_repo(path: Path) -> bool:
     return (path / ".git").is_dir()
 
 
-def find_git_repos(search_dir: Path, max_depth: int = 2) -> list[Path]:
+def find_git_repos(search_dir: Path, max_depth: int = 2,
+                   exclude: Path | None = None) -> list[Path]:
     """Search search_dir and its subdirectories (up to max_depth levels)
     for anything that is itself a git repo. Manually fetched/cloned
     mirrors are often nested one or two levels deep in an unpredictable
     folder, e.g. gcc.git/gcc-13.2.0/ where gcc.git itself is just a plain
-    container folder, not a repo."""
+    container folder, not a repo. `exclude` skips a path (e.g. the rtems
+    repo itself, which is also a valid git repo but is not a gcc mirror)."""
     found = []
+    if exclude is not None and search_dir == exclude:
+        return found
     if is_git_repo(search_dir):
         found.append(search_dir)
         return found  # a repo's own subdirectories aren't separate repos
@@ -146,12 +150,12 @@ def find_git_repos(search_dir: Path, max_depth: int = 2) -> list[Path]:
         return found
     for child in sorted(search_dir.iterdir()):
         if child.is_dir():
-            found.extend(find_git_repos(child, max_depth - 1))
+            found.extend(find_git_repos(child, max_depth - 1, exclude))
     return found
 
 
-def find_gcc_mirror(search_dir: Path) -> Path:
-    candidates = find_git_repos(search_dir)
+def find_gcc_mirror(search_dir: Path, exclude: Path | None = None) -> Path:
+    candidates = find_git_repos(search_dir, exclude=exclude)
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) > 1:
@@ -178,7 +182,8 @@ def main() -> None:
 
     repo = args.repo.resolve()
     archives_dir = (args.archives or (repo / "src")).resolve()
-    gcc_mirror = (args.gcc_mirror or find_gcc_mirror(repo.parent)).resolve()
+    gcc_mirror = (args.gcc_mirror or
+                 find_gcc_mirror(repo.parent, exclude=repo)).resolve()
     source_dir = repo / "spec-pkg-tools" / "pkg" / "source"
 
     if not source_dir.is_dir():
