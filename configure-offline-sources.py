@@ -48,6 +48,19 @@ DIRECTORY_RE = re.compile(r'^directory:.*$', re.MULTILINE)
 COMMIT_RE = re.compile(r'^commit:\s*(\S+)\s*$', re.MULTILINE)
 ORIGIN_COMMIT_RE = re.compile(r'^origin-commit:\s*(\S+)\s*$', re.MULTILINE)
 ORIGIN_BRANCH_RE = re.compile(r'^origin-branch:.*$', re.MULTILINE)
+ENABLED_BY_BLOCK_RE = re.compile(
+    r'^enabled-by:[^\n]*\n(?:^-[^\n]*\n|^[ \t]+-[^\n]*\n)*', re.MULTILINE)
+
+
+def disable_pkg(yml_path: Path) -> None:
+    text = yml_path.read_text()
+    new_text, count = ENABLED_BY_BLOCK_RE.subn("enabled-by: false\n", text,
+                                               count=1)
+    if count == 0:
+        print(f"  skip {yml_path.name}: no enabled-by field found")
+        return
+    yml_path.write_text(new_text)
+    print(f"  disabled {yml_path.name}: enabled-by -> false")
 
 
 def make_local_git_mirror(source_tree: Path, dest: Path) -> str:
@@ -231,6 +244,11 @@ def main() -> None:
                        "real upstream commit, since that can't be "
                        "reconstructed from files alone. Mutually "
                        "exclusive with --gcc-mirror.")
+    parser.add_argument("--disable-qemu", action="store_true",
+                       help="set enabled-by: false in "
+                       "pkg/source/qemu.yml and pkg/deployment/qemu.yml, "
+                       "so aarch64/arm/riscv builds skip qemu entirely "
+                       "instead of building the emulator")
     args = parser.parse_args()
 
     repo = args.repo.resolve()
@@ -265,7 +283,15 @@ def main() -> None:
         else:
             print(f"  skip {yml_path.name}: unknown workspace-type")
 
-    print("\ndone. Only files under spec-pkg-tools/pkg/source/ were changed.")
+    if args.disable_qemu:
+        disable_pkg(source_dir / "qemu.yml")
+        disable_pkg(repo / "spec-pkg-tools" / "pkg" / "deployment" /
+                   "qemu.yml")
+        print("\ndone. Files under spec-pkg-tools/pkg/source/ were "
+              "changed, plus pkg/deployment/qemu.yml (--disable-qemu).")
+    else:
+        print("\ndone. Only files under spec-pkg-tools/pkg/source/ "
+              "were changed.")
 
 
 if __name__ == "__main__":
