@@ -32,6 +32,7 @@ Safe to re-run (idempotent).
 """
 import argparse
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -44,6 +45,15 @@ ARCHIVE_URL_BLOCK_RE = re.compile(
     r'^archive-url:[^\n]*\n(?:^-[^\n]*\n|^[ \t]+-[^\n]*\n)*', re.MULTILINE)
 
 DIRECTORY_RE = re.compile(r'^directory:.*$', re.MULTILINE)
+COMMIT_RE = re.compile(r'^commit:\s*(\S+)\s*$', re.MULTILINE)
+ORIGIN_COMMIT_RE = re.compile(r'^origin-commit:\s*(\S+)\s*$', re.MULTILINE)
+
+
+def has_commit(git_dir: Path, commit: str) -> bool:
+    result = subprocess.run(
+        ["git", "-C", str(git_dir), "cat-file", "-e", commit],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0
 
 
 def find_repo_root(script_dir: Path) -> Path:
@@ -83,10 +93,24 @@ def patch_archive_yml(yml_path: Path, archives_dir: Path) -> None:
 
 
 def patch_repository_yml(yml_path: Path, gcc_mirror: Path) -> None:
+    text = yml_path.read_text()
     if not gcc_mirror.exists():
         print(f"  WARNING {yml_path.name}: gcc mirror not found at "
               f"{gcc_mirror}")
-    text = yml_path.read_text()
+    else:
+        for label, regex in (("commit", COMMIT_RE),
+                              ("origin-commit", ORIGIN_COMMIT_RE)):
+            match = regex.search(text)
+            if not match:
+                continue
+            sha = match.group(1)
+            if has_commit(gcc_mirror, sha):
+                print(f"  {label} {sha[:12]}: present in {gcc_mirror.name}")
+            else:
+                print(f"  WARNING {label} {sha} is NOT in {gcc_mirror}: "
+                      f"the offline build will fail on this source until "
+                      f"that exact commit is fetched into the mirror while "
+                      f"you still have network access")
     new_text, count = DIRECTORY_RE.subn(f"directory: file://{gcc_mirror}",
                                         text, count=1)
     if count == 0:
@@ -96,24 +120,46 @@ def patch_repository_yml(yml_path: Path, gcc_mirror: Path) -> None:
     print(f"  patched {yml_path.name}: directory -> file://{gcc_mirror}")
 
 
-def is_bare_git_repo(path: Path) -> bool:
-    return path.is_dir() and (path / "HEAD").exists() and \
-        (path / "objects").is_dir() and (path / "refs").is_dir()
+def is_git_repo(path: Path) -> bool:
+    """True for a bare repo (HEAD/objects/refs at its root) or a normal
+    clone (has a .git subdirectory) - either works as a `git clone`/`git
+    fetch` source, whatever the containing folder happens to be named."""
+    if not path.is_dir():
+        return False
+    if (path / "HEAD").exists() and (path / "objects").is_dir() \
+            and (path / "refs").is_dir():
+        return True
+    return (path / ".git").is_dir()
+
+
+def find_git_repos(search_dir: Path, max_depth: int = 2) -> list[Path]:
+    """Search search_dir and its subdirectories (up to max_depth levels)
+    for anything that is itself a git repo. Manually fetched/cloned
+    mirrors are often nested one or two levels deep in an unpredictable
+    folder, e.g. gcc.git/gcc-13.2.0/ where gcc.git itself is just a plain
+    container folder, not a repo."""
+    found = []
+    if is_git_repo(search_dir):
+        found.append(search_dir)
+        return found  # a repo's own subdirectories aren't separate repos
+    if max_depth <= 0 or not search_dir.is_dir():
+        return found
+    for child in sorted(search_dir.iterdir()):
+        if child.is_dir():
+            found.extend(find_git_repos(child, max_depth - 1))
+    return found
 
 
 def find_gcc_mirror(search_dir: Path) -> Path:
-    named = search_dir / "gcc-mirror.git"
-    if is_bare_git_repo(named):
-        return named
-    candidates = [p for p in search_dir.iterdir() if is_bare_git_repo(p)]
+    candidates = find_git_repos(search_dir)
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) > 1:
-        names = ", ".join(c.name for c in candidates)
-        sys.exit(f"error: multiple bare git repos found in {search_dir} "
+        names = ", ".join(str(c.relative_to(search_dir)) for c in candidates)
+        sys.exit(f"error: multiple git repos found under {search_dir} "
                   f"({names}) - pass --gcc-mirror explicitly")
-    sys.exit(f"error: no bare git repo (gcc mirror) found in {search_dir} "
-              f"- pass --gcc-mirror explicitly")
+    sys.exit(f"error: no git repo (gcc mirror) found under {search_dir} "
+              f"(searched 2 levels deep) - pass --gcc-mirror explicitly")
 
 
 def main() -> None:
