@@ -47,6 +47,33 @@ ARCHIVE_URL_BLOCK_RE = re.compile(
 DIRECTORY_RE = re.compile(r'^directory:.*$', re.MULTILINE)
 COMMIT_RE = re.compile(r'^commit:\s*(\S+)\s*$', re.MULTILINE)
 ORIGIN_COMMIT_RE = re.compile(r'^origin-commit:\s*(\S+)\s*$', re.MULTILINE)
+ORIGIN_BRANCH_RE = re.compile(r'^origin-branch:.*$', re.MULTILINE)
+
+
+def make_local_git_mirror(source_tree: Path, dest: Path) -> str:
+    """Turn a plain, git-less source tree (e.g. a zip download with no
+    .git at all) into a real local git repository at `dest`, containing a
+    COPY of source_tree's files as a single new commit. Returns that new
+    commit's hash.
+
+    This does NOT reproduce the original upstream commit hash - that is
+    not possible from file content alone, a commit hash also depends on
+    parent commit(s), author/committer identities and timestamps, which a
+    bare source snapshot does not carry. The yml gets repointed at this
+    new commit instead (see patch_repository_yml's fake_commit path)."""
+    import shutil
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(source_tree, dest, ignore=shutil.ignore_patterns(".git"))
+    subprocess.run(["git", "init", "-q"], cwd=dest, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=dest, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=offline@local", "-c", "user.name=offline",
+         "commit", "-q", "-m", f"offline snapshot of {source_tree.name}"],
+        cwd=dest, check=True)
+    result = subprocess.run(["git", "-C", str(dest), "rev-parse", "HEAD"],
+                            capture_output=True, text=True, check=True)
+    return result.stdout.strip()
 
 
 def has_commit(git_dir: Path, commit: str) -> bool:
@@ -92,9 +119,24 @@ def patch_archive_yml(yml_path: Path, archives_dir: Path) -> None:
     print(f"  patched {yml_path.name}: archive-url -> file://{local_file}")
 
 
-def patch_repository_yml(yml_path: Path, gcc_mirror: Path) -> None:
+def patch_repository_yml(yml_path: Path, gcc_mirror: Path,
+                         fake_commit: str | None = None) -> None:
     text = yml_path.read_text()
-    if not gcc_mirror.exists():
+    if fake_commit is not None:
+        # No real git history available (e.g. a zip download) - gcc_mirror
+        # is a freshly fabricated repo whose one and only commit is
+        # fake_commit. Point `commit:` at it, and disable the second
+        # checkout (`origin-branch`/`origin-commit`) entirely, since that
+        # step needs a second, distinct, real historical commit we don't
+        # have. See make_local_git_mirror().
+        print(f"  NOTE {yml_path.name}: using a fabricated local commit "
+              f"({fake_commit[:12]}) instead of the real pinned commit - "
+              f"only correct if {gcc_mirror.name}'s source really matches "
+              f"the embedded-brains/gcc fork content, not vanilla GCC")
+        text = COMMIT_RE.sub(f"commit: {fake_commit}", text, count=1)
+        text = ORIGIN_BRANCH_RE.sub("origin-branch: ''", text, count=1)
+        text = ORIGIN_COMMIT_RE.sub("origin-commit: ''", text, count=1)
+    elif not gcc_mirror.exists():
         print(f"  WARNING {yml_path.name}: gcc mirror not found at "
               f"{gcc_mirror}")
     else:
@@ -163,7 +205,9 @@ def find_gcc_mirror(search_dir: Path, exclude: Path | None = None) -> Path:
         sys.exit(f"error: multiple git repos found under {search_dir} "
                   f"({names}) - pass --gcc-mirror explicitly")
     sys.exit(f"error: no git repo (gcc mirror) found under {search_dir} "
-              f"(searched 2 levels deep) - pass --gcc-mirror explicitly")
+              f"(searched 2 levels deep) - pass --gcc-mirror explicitly, "
+              f"or --gcc-source-tree if what you have is a plain source "
+              f"folder with no .git at all (e.g. a zip download)")
 
 
 def main() -> None:
@@ -178,12 +222,30 @@ def main() -> None:
     parser.add_argument("--gcc-mirror", type=Path, default=None,
                        help="path to the local gcc bare mirror "
                        "(default: auto-detected bare repo next to --repo)")
+    parser.add_argument("--gcc-source-tree", type=Path, default=None,
+                       help="path to a plain gcc source folder with no "
+                       ".git at all (e.g. extracted from a zip download). "
+                       "A local git repo is fabricated from a copy of it "
+                       "at <that path>-git-local, and gcc.yml is pointed "
+                       "at a NEW commit made from its contents - not the "
+                       "real upstream commit, since that can't be "
+                       "reconstructed from files alone. Mutually "
+                       "exclusive with --gcc-mirror.")
     args = parser.parse_args()
 
     repo = args.repo.resolve()
     archives_dir = (args.archives or (repo / "src")).resolve()
-    gcc_mirror = (args.gcc_mirror or
-                 find_gcc_mirror(repo.parent, exclude=repo)).resolve()
+    fake_commit = None
+    if args.gcc_source_tree:
+        source_tree = args.gcc_source_tree.resolve()
+        gcc_mirror = source_tree.parent / f"{source_tree.name}-git-local"
+        print(f"building a local git repo from {source_tree} "
+              f"-> {gcc_mirror} ...")
+        fake_commit = make_local_git_mirror(source_tree, gcc_mirror)
+        print(f"  new local commit: {fake_commit}\n")
+    else:
+        gcc_mirror = (args.gcc_mirror or
+                     find_gcc_mirror(repo.parent, exclude=repo)).resolve()
     source_dir = repo / "spec-pkg-tools" / "pkg" / "source"
 
     if not source_dir.is_dir():
@@ -197,7 +259,7 @@ def main() -> None:
     for yml_path in sorted(source_dir.glob("*.yml")):
         text = yml_path.read_text()
         if "workspace-type: repository" in text:
-            patch_repository_yml(yml_path, gcc_mirror)
+            patch_repository_yml(yml_path, gcc_mirror, fake_commit)
         elif "workspace-type: archive" in text:
             patch_archive_yml(yml_path, archives_dir)
         else:
